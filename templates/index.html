@@ -1,0 +1,168 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Low-Light Image Enhancement</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <div class="topbar">
+        <div class="logo">LE</div>
+        <div>
+          <div class="brand">Low-Light Enhancement</div>
+          <div style="font-size:0.85rem;color:var(--muted)">Enhance dark photos with simple controls</div>
+        </div>
+      </div>
+
+      {% for m in get_flashed_messages() %}
+        <div class="flash">{{ m }}</div>
+      {% endfor %}
+
+      <section class="card">
+        <h2>Upload Citra Low-Light (Preview Real-time)</h2>
+        <form id="uploadForm" action="/upload" method="post" enctype="multipart/form-data" onsubmit="return false;">
+          <div class="file-row">
+            <input id="fileInput" type="file" name="file" accept="image/png, image/jpeg" required />
+          </div>
+
+          <div class="params">
+            <label>CLAHE clip: <span id="clahe_val">3.0</span>
+              <input type="range" id="clahe_clip" name="clahe_clip" min="1" max="6" step="0.1" value="3.0" oninput="document.getElementById('clahe_val').innerText=this.value; schedulePreview();" />
+            </label>
+
+            <label>Denoise (h): <span id="denoise_val">4</span>
+              <input type="range" id="denoise_h" name="denoise_h" min="0" max="20" step="1" value="4" oninput="document.getElementById('denoise_val').innerText=this.value; schedulePreview();" />
+            </label>
+
+            <label>Sharpen amount: <span id="sharp_val">1.05</span>
+              <input type="range" id="unsharp_amount" name="unsharp_amount" min="1.0" max="2.0" step="0.05" value="1.05" oninput="document.getElementById('sharp_val').innerText=this.value; schedulePreview();" />
+            </label>
+
+            <label>Gamma (0 = auto): <span id="gamma_val">0</span>
+              <input type="range" id="gamma" name="gamma" min="0" max="1.4" step="0.05" value="0" oninput="document.getElementById('gamma_val').innerText=this.value; schedulePreview();" />
+            </label>
+
+            <label>Saturation boost: <span id="sat_val">1.18</span>
+              <input type="range" id="saturation_boost" name="saturation_boost" min="1.0" max="1.8" step="0.02" value="1.18" oninput="document.getElementById('sat_val').innerText=this.value; schedulePreview();" />
+            </label>
+
+            <label><input type="checkbox" id="apply_bilateral" name="apply_bilateral" value="1" checked onchange="schedulePreview();" /> Apply bilateral smoothing for dark images</label>
+          </div>
+
+          <div style="margin-top:8px">
+            <button id="finalizeBtn" type="button" class="btn">Finalize & Download</button>
+          </div>
+        </form>
+
+        <p>Sistem ini hanya ditujukan untuk citra low-light. Jika gambar sudah terang/normal, hasil dipertahankan apa adanya.</p>
+
+        <div class="card" style="margin-top:12px">
+          <h3>Live Preview</h3>
+          <div class="comparison">
+            <div class="panel">
+              <h4>Original</h4>
+              <img id="origPreview" src="" alt="original preview" />
+            </div>
+            <div class="panel">
+              <h4>Enhanced (live)</h4>
+              <img id="resPreview" src="" alt="result preview" />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Example Low-Light Images (LOLv2-real)</h2>
+        {% if examples %}
+          <ul class="examples">
+            {% for e in examples %}
+              <li><a href="#" onclick="processExample('{{ e }}');return false;">{{ e.split('/')[-1] }}</a></li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p>No dataset examples found in `LOLv2-real/test/low` or `LOLv2-real/train/low`.</p>
+        {% endif %}
+      </section>
+    </main>
+
+    <script>
+      let currentOrig = null;
+      let previewTimer = null;
+
+      function readParams() {
+        const clahe = document.getElementById('clahe_clip').value;
+        const denoise = document.getElementById('denoise_h').value;
+        const sharp = document.getElementById('unsharp_amount').value;
+        const gamma = document.getElementById('gamma').value;
+        const saturation_boost = document.getElementById('saturation_boost').value;
+        const apply_bilateral = document.getElementById('apply_bilateral').checked ? '1' : '0';
+        return {clahe_clip:clahe, denoise_h:denoise, unsharp_amount:sharp, gamma:gamma, saturation_boost:saturation_boost, apply_bilateral:apply_bilateral};
+      }
+
+      async function uploadFileForPreview(file) {
+        const fd = new FormData();
+        fd.append('file', file);
+        const res = await fetch('/upload_file', {method:'POST', body: fd});
+        const j = await res.json();
+        if (j.error) { alert(j.error); return null; }
+        currentOrig = j.orig;
+        document.getElementById('origPreview').src = j.orig_url;
+        // trigger initial preview
+        schedulePreview(0);
+        return j.orig;
+      }
+
+      function schedulePreview(delay=300) {
+        if (!currentOrig) return;
+        if (previewTimer) clearTimeout(previewTimer);
+        previewTimer = setTimeout(runPreview, delay);
+      }
+
+      async function runPreview(){
+        const params = readParams();
+        const payload = {orig: currentOrig, params: params};
+        const res = await fetch('/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        const j = await res.json();
+        if (j.error) { console.error(j.error); return; }
+        // update preview image (cache buster included by server)
+        document.getElementById('resPreview').src = j.res_url;
+      }
+
+      document.getElementById('fileInput').addEventListener('change', (ev)=>{
+        const f = ev.target.files[0];
+        if (f) uploadFileForPreview(f);
+      });
+
+      // finalize: submit full upload form with params to /upload to store result and redirect to view
+      document.getElementById('finalizeBtn').addEventListener('click', async ()=>{
+        const input = document.getElementById('fileInput');
+        if (input.files.length === 0) { alert('Pilih file dulu.'); return; }
+        const fd = new FormData();
+        fd.append('file', input.files[0]);
+        const p = readParams();
+        for (const k in p) fd.append(k, p[k]);
+        const res = await fetch('/upload', {method:'POST', body: fd});
+        // server redirects — follow it
+        if (res.redirected) {
+          window.location = res.url;
+        } else {
+          // try to read JSON or text error
+          try{ const j = await res.json(); alert(j.error || 'Done'); } catch(e){ window.location.reload(); }
+        }
+      });
+
+      // example links: call start_example then set preview
+      async function processExample(path) {
+        const fd = new FormData(); fd.append('path', path);
+        const res = await fetch('/start_example', {method:'POST', body: fd});
+        const j = await res.json();
+        if (j.error) { alert(j.error); return; }
+        currentOrig = j.orig;
+        document.getElementById('origPreview').src = j.orig_url;
+        schedulePreview(0);
+      }
+    </script>
+  </body>
+</html>

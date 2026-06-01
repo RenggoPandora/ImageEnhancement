@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Result - Image Enhancement</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <div class="topbar">
+        <div class="logo">LE</div>
+        <div>
+          <div class="brand">Hasil Enhancement</div>
+          <div style="font-size:0.85rem;color:var(--muted)">Preview and download enhanced image</div>
+        </div>
+      </div>
+      <div class="comparison">
+        <div class="panel">
+          <h3>Asli</h3>
+          <img src="/static/uploads/{{ orig }}" alt="original" />
+          <a class="btn" href="/download/orig/{{ orig }}">Download Original</a>
+        </div>
+        <div class="panel">
+          <h3>Enhanced</h3>
+          <img src="/static/results/{{ res }}" alt="result" />
+          <a class="btn" href="/download/result/{{ res }}">Download Result</a>
+        </div>
+      </div>
+      <p><a class="btn ghost" href="/">Back</a></p>
+    </main>
+  </body>
+</html>
