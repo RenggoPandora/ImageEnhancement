@@ -2,12 +2,10 @@ import os
 import uuid
 import time
 from pathlib import Path
-from flask import Flask, render_template, request, redirect, url_for, send_from_directory, flash
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, flash, jsonify
 import cv2
 import numpy as np
 import shutil
-from flask import jsonify
-
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / 'static' / 'uploads'
 RESULT_DIR = BASE_DIR / 'static' / 'results'
@@ -34,6 +32,50 @@ def read_image_from_bytes(buf):
     return img
 
 
+def calculate_channel_ssim(mu1, mu2, C1, C2):
+    window_size = 11
+    sigma = 1.5
+    
+    mu1_blur = cv2.GaussianBlur(mu1, (window_size, window_size), sigma)
+    mu2_blur = cv2.GaussianBlur(mu2, (window_size, window_size), sigma)
+    
+    mu1_sq = mu1_blur ** 2
+    mu2_sq = mu2_blur ** 2
+    mu1_mu2 = mu1_blur * mu2_blur
+    
+    sigma1_sq = cv2.GaussianBlur(mu1 ** 2, (window_size, window_size), sigma) - mu1_sq
+    sigma2_sq = cv2.GaussianBlur(mu2 ** 2, (window_size, window_size), sigma) - mu2_sq
+    sigma12 = cv2.GaussianBlur(mu1 * mu2, (window_size, window_size), sigma) - mu1_mu2
+    
+    numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+    denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+    ssim_map = numerator / denominator
+    return np.mean(ssim_map)
+
+
+def calculate_ssim(img1, img2):
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
+
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    
+    if len(img1.shape) == 3:
+        ssims = []
+        for i in range(3):
+            ssims.append(calculate_channel_ssim(img1[:,:,i], img2[:,:,i], C1, C2))
+        return float(np.mean(ssims))
+    else:
+        return float(calculate_channel_ssim(img1, img2, C1, C2))
+
+
+def calculate_psnr(img1, img2):
+    mse = np.mean((img1.astype(np.float64) - img2.astype(np.float64)) ** 2)
+    if mse == 0:
+        return float('inf')
+    return float(20 * np.log10(255.0 / np.sqrt(mse)))
+
+
 def enhancement_pipeline(img, params=None):
     # Adaptive classical enhancement pipeline (brightness-aware)
     def grayworld_white_balance(bgr):
@@ -58,7 +100,18 @@ def enhancement_pipeline(img, params=None):
         return np.clip(stretched, 0, 255).astype(np.uint8)
 
     img = img.copy()
-    wb = grayworld_white_balance(img)
+    apply_wb = False  # default to False since Grayworld desaturates low-light images
+    if params:
+        try:
+            if 'apply_wb' in params:
+                apply_wb = bool(int(params.get('apply_wb')))
+        except Exception:
+            pass
+
+    if apply_wb:
+        wb = grayworld_white_balance(img)
+    else:
+        wb = img
 
     # Estimate brightness and focus
     lab_tmp = cv2.cvtColor(wb, cv2.COLOR_BGR2Lab)
@@ -79,7 +132,7 @@ def enhancement_pipeline(img, params=None):
         unsharp_blur_sigma = 1.0
         apply_bilateral = True
         gamma_default = 0.75
-        saturation_boost = 1.18
+        saturation_boost = 1.8
     else:
         h_color = 1
         clahe_clip = 1.6
@@ -141,7 +194,8 @@ def enhancement_pipeline(img, params=None):
         denoised = wb
 
     lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2Lab)
-    L, a, b = cv2.split(lab)
+    L_orig, a, b = cv2.split(lab)
+    L = L_orig.copy()
 
     # Low-light mode benefits from luminance stretching before local contrast
     if low_light:
@@ -162,15 +216,30 @@ def enhancement_pipeline(img, params=None):
     L_gamma = np.power(L_float, gamma)
     L_out = np.clip((L_gamma * 255.0), 0, 255).astype(np.uint8)
 
-    merged_lab = cv2.merge([L_out, a, b])
-    result = cv2.cvtColor(merged_lab, cv2.COLOR_Lab2BGR)
+    # Proportional chroma scaling to maintain saturation when luminance increases
+    if low_light:
+        L_safe = np.maximum(L_orig.astype(np.float32), 1.0)
+        # Compute ratio of luminance increase
+        ratio = L_out.astype(np.float32) / L_safe
+        
+        # Moderate the ratio to prevent noise blowout (power law + clip)
+        ratio = np.clip(np.power(ratio, 0.65), 1.0, 10.0)
+        
+        # Scale with saturation_boost slider
+        chroma_scale = ratio * saturation_boost
+        
+        # Reshape or apply element-wise
+        a_centered = a.astype(np.float32) - 128.0
+        b_centered = b.astype(np.float32) - 128.0
+        
+        a_out = np.clip(a_centered * chroma_scale + 128.0, 0, 255).astype(np.uint8)
+        b_out = np.clip(b_centered * chroma_scale + 128.0, 0, 255).astype(np.uint8)
+    else:
+        a_out = a
+        b_out = b
 
-    # Restore colorfulness for low-light images after luminance enhancement.
-    # This keeps the tone natural while avoiding the grayish look.
-    if low_light and saturation_boost > 1.0:
-        hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation_boost, 0, 255)
-        result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    merged_lab = cv2.merge([L_out, a_out, b_out])
+    result = cv2.cvtColor(merged_lab, cv2.COLOR_Lab2BGR)
 
     # Edge-aware sharpening: only strengthen edges to avoid amplifying noise
     # Create sharpened version
@@ -221,7 +290,7 @@ def index():
         if p.exists():
             for f in sorted(p.glob('*'))[:20]:
                 if f.suffix.lower() in ALLOWED_EXT:
-                    examples.append(str(f.relative_to(BASE_DIR)))
+                    examples.append(str(f.relative_to(BASE_DIR)).replace('\\', '/'))
     return render_template('index.html', examples=examples)
 
 
@@ -231,44 +300,59 @@ def upload():
     cleanup_old_files(RESULT_DIR)
 
     file = request.files.get('file')
-    if not file or file.filename == '':
+    orig_name = request.form.get('orig')
+
+    if (not file or file.filename == '') and not orig_name:
         flash('No file selected')
         return redirect(url_for('index'))
 
-    if not allowed_file(file.filename):
-        flash('Unsupported file type')
-        return redirect(url_for('index'))
+    if file and file.filename != '':
+        if not allowed_file(file.filename):
+            flash('Unsupported file type')
+            return redirect(url_for('index'))
 
-    file.stream.seek(0, os.SEEK_END)
-    size = file.stream.tell()
-    file.stream.seek(0)
-    if size > MAX_FILE_SIZE:
-        flash('File too large (max 5 MB)')
-        return redirect(url_for('index'))
+        file.stream.seek(0, os.SEEK_END)
+        size = file.stream.tell()
+        file.stream.seek(0)
+        if size > MAX_FILE_SIZE:
+            flash('File too large (max 5 MB)')
+            return redirect(url_for('index'))
 
-    data = file.read()
-    img = read_image_from_bytes(data)
-    if img is None:
-        flash('Failed to read image')
-        return redirect(url_for('index'))
+        data = file.read()
+        img = read_image_from_bytes(data)
+        if img is None:
+            flash('Failed to read image')
+            return redirect(url_for('index'))
 
-    uid = uuid.uuid4().hex
-    orig_name = f'{uid}_orig.jpg'
-    res_name = f'{uid}_res.jpg'
-    orig_path = UPLOAD_DIR / orig_name
-    res_path = RESULT_DIR / res_name
-
-    save_image(orig_path, img)
+        uid = uuid.uuid4().hex
+        orig_name = f'{uid}_orig.jpg'
+        res_name = f'{uid}_res.jpg'
+        orig_path = UPLOAD_DIR / orig_name
+        res_path = RESULT_DIR / res_name
+        save_image(orig_path, img)
+    else:
+        orig_path = UPLOAD_DIR / orig_name
+        if not orig_path.exists():
+            flash('Original image not found')
+            return redirect(url_for('index'))
+        img = cv2.imread(str(orig_path))
+        if img is None:
+            flash('Failed to read original image')
+            return redirect(url_for('index'))
+        uid = orig_name.split('_')[0]
+        res_name = f'{uid}_res.jpg'
+        res_path = RESULT_DIR / res_name
     # collect tuning params from form
     params = {}
-    for key in ('clahe_clip', 'denoise_h', 'unsharp_amount', 'gamma', 'apply_bilateral'):
+    for key in ('clahe_clip', 'denoise_h', 'unsharp_amount', 'gamma', 'apply_bilateral', 'saturation_boost', 'apply_wb', 'gt_path'):
         if key in request.form:
             params[key] = request.form.get(key)
 
     out = enhancement_pipeline(img, params=params)
     save_image(res_path, out)
 
-    return redirect(url_for('view_result', orig=orig_name, res=res_name))
+    gt_path_val = params.get('gt_path', '')
+    return redirect(url_for('view_result', orig=orig_name, res=res_name, gt_path=gt_path_val))
 
 
 @app.route('/upload_file', methods=['POST'])
@@ -315,7 +399,19 @@ def start_example():
     except Exception:
         return jsonify({'error': 'copy failed'}), 500
 
-    return jsonify({'orig': orig_name, 'orig_url': f'/static/uploads/{orig_name}'})
+    # Determine ground truth path
+    gt_path_rel = None
+    if 'low' in full.name:
+        new_name = full.name.replace('low', 'normal')
+        gt_path = full.parent.parent / 'high' / new_name
+        if gt_path.exists():
+            gt_path_rel = str(gt_path.relative_to(BASE_DIR)).replace('\\', '/')
+
+    return jsonify({
+        'orig': orig_name, 
+        'orig_url': f'/static/uploads/{orig_name}',
+        'gt_path': gt_path_rel
+    })
 
 
 @app.route('/preview', methods=['POST'])
@@ -340,7 +436,26 @@ def preview():
     preview_name = f'{uid}_preview.jpg'
     preview_path = RESULT_DIR / preview_name
     save_image(preview_path, out)
-    return jsonify({'res_url': f'/static/results/{preview_name}?t={int(time.time())}'})
+
+    # Calculate accuracy if gt_path is provided
+    gt_path_rel = data.get('gt_path')
+    psnr_val = None
+    ssim_val = None
+    if gt_path_rel:
+        gt_full = (BASE_DIR / gt_path_rel).resolve()
+        if gt_full.exists():
+            gt_img = cv2.imread(str(gt_full))
+            if gt_img is not None:
+                if gt_img.shape != out.shape:
+                    gt_img = cv2.resize(gt_img, (out.shape[1], out.shape[0]))
+                psnr_val = calculate_psnr(out, gt_img)
+                ssim_val = calculate_ssim(out, gt_img)
+
+    return jsonify({
+        'res_url': f'/static/results/{preview_name}?t={int(time.time())}',
+        'psnr': psnr_val,
+        'ssim': ssim_val
+    })
 
 
 @app.route('/process_example')
@@ -379,26 +494,49 @@ def process_example():
     res_path = RESULT_DIR / res_name
 
     save_image(orig_path, img)
+    # Determine ground truth path
+    gt_path_rel = None
+    if 'low' in full.name:
+        new_name = full.name.replace('low', 'normal')
+        gt_path = full.parent.parent / 'high' / new_name
+        if gt_path.exists():
+            gt_path_rel = str(gt_path.relative_to(BASE_DIR)).replace('\\', '/')
+
     # collect tuning params from query string
     params = {}
-    for key in ('clahe_clip', 'denoise_h', 'unsharp_amount', 'gamma', 'apply_bilateral'):
+    for key in ('clahe_clip', 'denoise_h', 'unsharp_amount', 'gamma', 'apply_bilateral', 'saturation_boost', 'apply_wb'):
         if key in request.args:
             params[key] = request.args.get(key)
 
     out = enhancement_pipeline(img, params=params)
     save_image(res_path, out)
 
-    return redirect(url_for('view_result', orig=orig_name, res=res_name))
+    return redirect(url_for('view_result', orig=orig_name, res=res_name, gt_path=gt_path_rel))
 
 
 @app.route('/view')
 def view_result():
     orig = request.args.get('orig')
     res = request.args.get('res')
+    gt_path = request.args.get('gt_path')
     if not orig or not res:
         flash('Result not found')
         return redirect(url_for('index'))
-    return render_template('view.html', orig=orig, res=res)
+
+    psnr_val = None
+    ssim_val = None
+    if gt_path:
+        gt_full = (BASE_DIR / gt_path).resolve()
+        if gt_full.exists():
+            res_img = cv2.imread(str(RESULT_DIR / res))
+            gt_img = cv2.imread(str(gt_full))
+            if res_img is not None and gt_img is not None:
+                if gt_img.shape != res_img.shape:
+                    gt_img = cv2.resize(gt_img, (res_img.shape[1], res_img.shape[0]))
+                psnr_val = calculate_psnr(res_img, gt_img)
+                ssim_val = calculate_ssim(res_img, gt_img)
+
+    return render_template('view.html', orig=orig, res=res, gt_path=gt_path, psnr=psnr_val, ssim=ssim_val)
 
 
 @app.route('/static/uploads/<path:fname>')
